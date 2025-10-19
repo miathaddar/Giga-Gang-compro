@@ -1,0 +1,174 @@
+// BALL SHOOTING ROBOT GRIPPER CONTROL
+
+#include <Servo.h>
+#define GRIPPER_SERVO_PIN 9      
+#define BUTTON_OPEN_PIN 7        
+#define BUTTON_CLOSE_PIN 6       
+#define BUTTON_STOP_PIN 5        
+#define LED_READY 8              
+
+
+Servo gripperServo;
+
+
+#define SERVO_OPEN_ANGLE 175
+#define SERVO_CLOSED_ANGLE 5    
+#define SERVO_NEUTRAL_ANGLE 90  
+
+#define OPENING_AT_OPEN 135     
+#define OPENING_AT_CLOSED 10
+#define OPENING_AT_NEUTRAL 53    
+
+#define SERVO_SPEED_MS 15        
+#define DEBOUNCE_DELAY 20       
+#define HOLD_TIME_MS 100        
+
+
+int currentAngle = SERVO_NEUTRAL_ANGLE;
+int targetAngle = SERVO_NEUTRAL_ANGLE;
+unsigned long lastMoveTime = 0;
+boolean gripperMoving = false;
+boolean ballHeld = false;
+
+
+void setup() {
+
+  Serial.begin(9600);
+  
+
+  gripperServo.attach(GRIPPER_SERVO_PIN);
+  gripperServo.write(currentAngle);
+  pinMode(BUTTON_OPEN_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_CLOSE_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_STOP_PIN, INPUT_PULLUP);
+  pinMode(LED_READY, OUTPUT);
+  
+  delay(500);
+  digitalWrite(LED_READY, HIGH);  
+  
+  Serial.println("Gripper initialized!");
+  Serial.println("Open range: " + String(SERVO_OPEN_ANGLE) + "°");
+  Serial.println("Close range: " + String(SERVO_CLOSED_ANGLE) + "°");
+}
+
+
+void loop() {
+
+  checkButtons();
+  updateServoPosition();
+  monitorGripperState();
+  delay(10);
+}
+
+
+void checkButtons() {
+  if (digitalRead(BUTTON_OPEN_PIN) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(BUTTON_OPEN_PIN) == LOW) {
+      openGripper();
+      while (digitalRead(BUTTON_OPEN_PIN) == LOW) {
+        delay(10);  // Wait for button release
+      }
+      delay(DEBOUNCE_DELAY);
+    }
+  }
+  
+  if (digitalRead(BUTTON_CLOSE_PIN) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(BUTTON_CLOSE_PIN) == LOW) {
+      closeGripper();
+      while (digitalRead(BUTTON_CLOSE_PIN) == LOW) {
+        delay(10);  // Wait for button release
+      }
+      delay(DEBOUNCE_DELAY);
+    }
+  }
+  
+  if (digitalRead(BUTTON_STOP_PIN) == LOW) {
+    delay(DEBOUNCE_DELAY);
+    if (digitalRead(BUTTON_STOP_PIN) == LOW) {
+      stopGripper();
+      Serial.println("EMERGENCY STOP");
+      while (digitalRead(BUTTON_STOP_PIN) == LOW) {
+        delay(10);
+      }
+      delay(DEBOUNCE_DELAY);
+    }
+  }
+}
+
+
+void openGripper() {
+  Serial.println("Opening gripper...");
+  targetAngle = SERVO_OPEN_ANGLE;
+  gripperMoving = true;
+  ballHeld = false;
+}
+
+void closeGripper() {
+  Serial.println("Closing gripper...");
+  targetAngle = SERVO_CLOSED_ANGLE;
+  gripperMoving = true;
+}
+
+void stopGripper() {
+  Serial.println("Stopping gripper motion");
+  targetAngle = currentAngle;
+  gripperMoving = false;
+}
+
+void setGripperPosition(int angle) {
+  angle = constrain(angle, SERVO_CLOSED_ANGLE, SERVO_OPEN_ANGLE);
+  targetAngle = angle;
+  gripperMoving = true;
+}
+
+void updateServoPosition() {
+ 
+  
+  if (currentAngle != targetAngle) {
+    unsigned long currentTime = millis();
+    
+    if (currentTime - lastMoveTime >= SERVO_SPEED_MS) {
+    
+      if (currentAngle < targetAngle) {
+        currentAngle++;
+      } else if (currentAngle > targetAngle) {
+        currentAngle--;
+      }
+      
+      gripperServo.write(currentAngle);
+      lastMoveTime = currentTime;
+      
+      Serial.print("Servo angle: ");
+      Serial.println(currentAngle);
+    }
+  } else {
+    gripperMoving = false;
+  }
+}
+
+void monitorGripperState() {
+  
+  if (currentAngle >= SERVO_OPEN_ANGLE - 5) {
+    // Gripper is open
+    digitalWrite(LED_READY, LOW);
+    if (ballHeld) {
+      ballHeld = false;
+      Serial.println("Ball released");
+    }
+  } 
+  else if (currentAngle <= SERVO_CLOSED_ANGLE + 5) {
+    // Gripper is closed
+    digitalWrite(LED_READY, HIGH);
+    if (!ballHeld && !gripperMoving) {
+      ballHeld = true;
+      Serial.println("Ball gripped");
+    }
+  } 
+  else {
+    // Gripper is in mid-position
+    digitalWrite(LED_READY, digitalRead(LED_READY)); // Blink indicator
+  }
+}
+
