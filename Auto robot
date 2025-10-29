@@ -1,0 +1,222 @@
+/ Maze Follower using IMU (MPU6050) + Ultrasonic Sensors
+// Uses "Left-Hand Rule" - always follow the left wall
+
+#include <Wire.h>
+#include <MPU6050.h>
+
+// MPU6050 IMU sensor
+MPU6050 mpu;
+
+// Ultrasonic sensors
+const int trig_front = 9;
+const int echo_front = 10;
+const int trig_left = 11;
+const int echo_left = 12;
+const int trig_right = 7;
+const int echo_right = 8;
+
+// Motor pins (example - adjust for your motor driver)
+const int motor_left_fwd = 3;
+const int motor_left_bck = 4;
+const int motor_right_fwd = 5;
+const int motor_right_bck = 6;
+
+// IMU variables
+float yaw = 0.0;           // Current heading angle (0-360°)
+float target_yaw = 0.0;    // Desired heading angle
+float gyro_z = 0.0;        // Z-axis rotation rate
+unsigned long last_time = 0;
+
+// Distance thresholds
+const float WALL_DISTANCE = 15.0;  // cm - ideal distance from wall
+const float FRONT_THRESHOLD = 20.0; // cm - when to turn
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  
+  // Initialize MPU6050
+  Serial.println("Initializing IMU...");
+  mpu.initialize();
+  
+  if (mpu.testConnection()) {
+    Serial.println("IMU connected!");
+  } else {
+    Serial.println("IMU connection failed!");
+    while(1); // Stop if IMU not working
+  }
+  
+  // Calibrate gyroscope (keep robot still!)
+  Serial.println("Calibrating... Keep robot still!");
+  delay(2000);
+  mpu.setZGyroOffset(0); // You may need to calibrate this value
+  
+  // Setup ultrasonic pins
+  pinMode(trig_front, OUTPUT);
+  pinMode(echo_front, INPUT);
+  pinMode(trig_left, OUTPUT);
+  pinMode(echo_left, INPUT);
+  pinMode(trig_right, OUTPUT);
+  pinMode(echo_right, INPUT);
+  
+  // Setup motor pins
+  pinMode(motor_left_fwd, OUTPUT);
+  pinMode(motor_left_bck, OUTPUT);
+  pinMode(motor_right_fwd, OUTPUT);
+  pinMode(motor_right_bck, OUTPUT);
+  
+  last_time = millis();
+  Serial.println("Starting maze solver!");
+}
+
+void loop() {
+  // Update IMU heading
+  updateHeading();
+  
+  // Get distances from ultrasonic sensors
+  float dist_front = getDistance(trig_front, echo_front);
+  float dist_left = getDistance(trig_left, echo_left);
+  float dist_right = getDistance(trig_right, echo_right);
+  
+  // Print debug info
+  Serial.print("Yaw: ");
+  Serial.print(yaw);
+  Serial.print("° | F:");
+  Serial.print(dist_front);
+  Serial.print(" L:");
+  Serial.print(dist_left);
+  Serial.print(" R:");
+  Serial.println(dist_right);
+  
+  // LEFT-HAND RULE MAZE ALGORITHM
+  if (dist_left > 25.0) {
+    // No wall on left - turn left to follow it
+    turnLeft90();
+    Serial.println("Action: Turn LEFT (no left wall)");
+  }
+  else if (dist_front < FRONT_THRESHOLD) {
+    // Wall in front - turn right
+    turnRight90();
+    Serial.println("Action: Turn RIGHT (wall ahead)");
+  }
+  else {
+    // Keep going straight, but adjust to stay parallel to left wall
+    moveForwardWithWallFollow(dist_left);
+  }
+  
+  delay(100);
+}
+
+// Update robot heading from gyroscope
+void updateHeading() {
+  unsigned long current_time = millis();
+  float dt = (current_time - last_time) / 1000.0; // Time in seconds
+  
+  // Read gyroscope Z-axis (rotation rate in degrees/second)
+  int16_t gz;
+  mpu.getRotationZ(&gz);
+  gyro_z = gz / 131.0; // Convert to degrees/second (for MPU6050)
+  
+  // Integrate rotation rate to get angle
+  yaw += gyro_z * dt;
+  
+  // Keep yaw in 0-360 range
+  if (yaw < 0) yaw += 360;
+  if (yaw >= 360) yaw -= 360;
+  
+  last_time = current_time;
+}
+
+// Turn left exactly 90 degrees using IMU
+void turnLeft90() {
+  target_yaw = yaw - 90.0;
+  if (target_yaw < 0) target_yaw += 360;
+  
+  // Turn until we reach target angle
+  while (abs(yaw - target_yaw) > 5.0) { // 5° tolerance
+    updateHeading();
+    
+    // Spin left
+    analogWrite(motor_left_fwd, 0);
+    analogWrite(motor_left_bck, 150);
+    analogWrite(motor_right_fwd, 150);
+    analogWrite(motor_right_bck, 0);
+    
+    delay(10);
+  }
+  
+  stopMotors();
+  delay(200);
+}
+
+// Turn right exactly 90 degrees using IMU
+void turnRight90() {
+  target_yaw = yaw + 90.0;
+  if (target_yaw >= 360) target_yaw -= 360;
+  
+  // Turn until we reach target angle
+  while (abs(yaw - target_yaw) > 5.0) { // 5° tolerance
+    updateHeading();
+    
+    // Spin right
+    analogWrite(motor_left_fwd, 150);
+    analogWrite(motor_left_bck, 0);
+    analogWrite(motor_right_fwd, 0);
+    analogWrite(motor_right_bck, 150);
+    
+    delay(10);
+  }
+  
+  stopMotors();
+  delay(200);
+}
+
+// Move forward while maintaining distance from left wall
+void moveForwardWithWallFollow(float left_distance) {
+  int base_speed = 150;
+  int correction = 0;
+  
+  // PID-like correction to stay parallel to wall
+  float error = left_distance - WALL_DISTANCE;
+  correction = error * 3; // Proportional control (tune this!)
+  
+  // Limit correction
+  correction = constrain(correction, -50, 50);
+  
+  // Apply correction to motors
+  int left_speed = base_speed - correction;
+  int right_speed = base_speed + correction;
+  
+  // Constrain speeds
+  left_speed = constrain(left_speed, 0, 255);
+  right_speed = constrain(right_speed, 0, 255);
+  
+  // Move forward
+  analogWrite(motor_left_fwd, left_speed);
+  analogWrite(motor_left_bck, 0);
+  analogWrite(motor_right_fwd, right_speed);
+  analogWrite(motor_right_bck, 0);
+}
+
+// Stop all motors
+void stopMotors() {
+  analogWrite(motor_left_fwd, 0);
+  analogWrite(motor_left_bck, 0);
+  analogWrite(motor_right_fwd, 0);
+  analogWrite(motor_right_bck, 0);
+}
+
+// Get distance from ultrasonic sensor
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  float duration = pulseIn(echo, HIGH, 30000); // 30ms timeout
+  if (duration == 0) return 999; // No echo received
+  
+  float distance = (duration * 0.034) / 2;
+  return distance;
+}
