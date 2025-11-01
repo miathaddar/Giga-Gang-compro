@@ -113,9 +113,9 @@ float gyro_z_offset = 0.0;
 unsigned long last_time = 0;
 
 // ==================== CONFIGURATION ====================
-const float WALL_DISTANCE = 15.0;     // Target distance from left wall (cm)
-const float FRONT_THRESHOLD = 20.0;   // Stop distance (cm)
-const float NO_WALL_THRESHOLD = 30.0; // Distance considered "no wall"
+const float WALL_DISTANCE = 3.0;     // Target distance from left wall (cm)
+const float FRONT_THRESHOLD = 5.0;   // Stop distance (cm)
+const float NO_WALL_THRESHOLD = 25.0; // Distance considered "no wall"
 const int BASE_SPEED = 120;           // Base motor speed (0-255)
 const int TURN_SPEED = 140;           // Speed during turns
 const float TURN_TOLERANCE = 3.0;     // Acceptable angle error (degrees)
