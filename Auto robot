@@ -122,7 +122,7 @@ const float TURN_TOLERANCE = 3.0;     // Acceptable angle error (degrees)
 
 // ==================== SETUP ====================
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
   Wire.begin();
   
   // Initialize MPU6050
