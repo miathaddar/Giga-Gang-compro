@@ -1,204 +1,345 @@
-/ Maze Follower using IMU (MPU6050) + Ultrasonic Sensors
-// Uses "Left-Hand Rule" - always follow the left wall
+// Optimized Maze Follower with Kalman Filter + PID Control
+// Features: Kalman filtering for ultrasonics, PID for turning and wall following
 
 #include <Wire.h>
 #include <MPU6050.h>
 
-// MPU6050 IMU sensor
+// ==================== HARDWARE PINS ====================
 MPU6050 mpu;
 
 // Ultrasonic sensors
-const int trig_front = 9;
-const int echo_front = 10;
-const int trig_left = 11;
-const int echo_left = 12;
-const int trig_right = 7;
-const int echo_right = 8;
+const int trig_front = 9, echo_front = 10;
+const int trig_left = 11, echo_left = 12;
+const int trig_right = 7, echo_right = 8;
 
-// Motor pins (example - adjust for your motor driver)
-const int motor_left_fwd = 3;
-const int motor_left_bck = 4;
-const int motor_right_fwd = 5;
-const int motor_right_bck = 6;
+// Motor pins
+const int motor_left_fwd = 3, motor_left_bck = 4;
+const int motor_right_fwd = 5, motor_right_bck = 6;
 
-// IMU variables
-float yaw = 0.0;           // Current heading angle (0-360°)
-float target_yaw = 0.0;    // Desired heading angle
-float gyro_z = 0.0;        // Z-axis rotation rate
+// ==================== KALMAN FILTER CLASS ====================
+class KalmanFilter {
+private:
+  float Q; // Process noise covariance
+  float R; // Measurement noise covariance
+  float P; // Estimation error covariance
+  float K; // Kalman gain
+  float X; // Estimated value
+  
+public:
+  KalmanFilter(float process_noise, float measurement_noise, float initial_value) {
+    Q = process_noise;
+    R = measurement_noise;
+    P = 1.0;
+    X = initial_value;
+  }
+  
+  float update(float measurement) {
+    // Prediction
+    P = P + Q;
+    
+    // Update
+    K = P / (P + R);
+    X = X + K * (measurement - X);
+    P = (1 - K) * P;
+    
+    return X;
+  }
+  
+  float getValue() { return X; }
+  void reset(float value) { X = value; P = 1.0; }
+};
+
+// Kalman filters for each ultrasonic sensor
+KalmanFilter kf_front(0.5, 2.0, 50.0);  // Q, R, initial_value
+KalmanFilter kf_left(0.5, 2.0, 50.0);
+KalmanFilter kf_right(0.5, 2.0, 50.0);
+
+// ==================== PID CONTROLLER CLASS ====================
+class PIDController {
+private:
+  float Kp, Ki, Kd;
+  float integral, prev_error;
+  float output_min, output_max;
+  unsigned long last_time;
+  
+public:
+  PIDController(float p, float i, float d, float min_out, float max_out) {
+    Kp = p; Ki = i; Kd = d;
+    output_min = min_out;
+    output_max = max_out;
+    reset();
+  }
+  
+  float compute(float setpoint, float measured_value) {
+    unsigned long now = millis();
+    float dt = (now - last_time) / 1000.0;
+    if (dt <= 0) dt = 0.01;
+    last_time = now;
+    
+    // Calculate error
+    float error = setpoint - measured_value;
+    
+    // Integral with anti-windup
+    integral += error * dt;
+    integral = constrain(integral, output_min / Ki, output_max / Ki);
+    
+    // Derivative
+    float derivative = (error - prev_error) / dt;
+    prev_error = error;
+    
+    // PID output
+    float output = Kp * error + Ki * integral + Kd * derivative;
+    return constrain(output, output_min, output_max);
+  }
+  
+  void reset() {
+    integral = 0;
+    prev_error = 0;
+    last_time = millis();
+  }
+  
+  void setTunings(float p, float i, float d) {
+    Kp = p; Ki = i; Kd = d;
+  }
+};
+
+// PID controllers
+PIDController pid_turn(3.5, 0.8, 1.2, -255, 255);      // For precise turning
+PIDController pid_wall(4.0, 0.2, 1.5, -80, 80);        // For wall following
+
+// ==================== IMU VARIABLES ====================
+float yaw = 0.0;
+float gyro_z_offset = 0.0;
 unsigned long last_time = 0;
 
-// Distance thresholds
-const float WALL_DISTANCE = 15.0;  // cm - ideal distance from wall
-const float FRONT_THRESHOLD = 20.0; // cm - when to turn
+// ==================== CONFIGURATION ====================
+const float WALL_DISTANCE = 15.0;     // Target distance from left wall (cm)
+const float FRONT_THRESHOLD = 20.0;   // Stop distance (cm)
+const float NO_WALL_THRESHOLD = 30.0; // Distance considered "no wall"
+const int BASE_SPEED = 120;           // Base motor speed (0-255)
+const int TURN_SPEED = 140;           // Speed during turns
+const float TURN_TOLERANCE = 3.0;     // Acceptable angle error (degrees)
 
+// ==================== SETUP ====================
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   Wire.begin();
   
   // Initialize MPU6050
   Serial.println("Initializing IMU...");
   mpu.initialize();
   
-  if (mpu.testConnection()) {
-    Serial.println("IMU connected!");
-  } else {
+  if (!mpu.testConnection()) {
     Serial.println("IMU connection failed!");
-    while(1); // Stop if IMU not working
+    while(1);
   }
+  Serial.println("IMU connected!");
   
-  // Calibrate gyroscope (keep robot still!)
-  Serial.println("Calibrating... Keep robot still!");
-  delay(2000);
-  mpu.setZGyroOffset(0); // You may need to calibrate this value
+  // Calibrate gyroscope
+  Serial.println("Calibrating gyroscope... Keep still for 3 seconds!");
+  delay(1000);
+  calibrateGyro();
   
-  // Setup ultrasonic pins
-  pinMode(trig_front, OUTPUT);
-  pinMode(echo_front, INPUT);
-  pinMode(trig_left, OUTPUT);
-  pinMode(echo_left, INPUT);
-  pinMode(trig_right, OUTPUT);
-  pinMode(echo_right, INPUT);
+  // Setup pins
+  pinMode(trig_front, OUTPUT); pinMode(echo_front, INPUT);
+  pinMode(trig_left, OUTPUT);  pinMode(echo_left, INPUT);
+  pinMode(trig_right, OUTPUT); pinMode(echo_right, INPUT);
   
-  // Setup motor pins
-  pinMode(motor_left_fwd, OUTPUT);
-  pinMode(motor_left_bck, OUTPUT);
-  pinMode(motor_right_fwd, OUTPUT);
-  pinMode(motor_right_bck, OUTPUT);
+  pinMode(motor_left_fwd, OUTPUT);  pinMode(motor_left_bck, OUTPUT);
+  pinMode(motor_right_fwd, OUTPUT); pinMode(motor_right_bck, OUTPUT);
   
   last_time = millis();
-  Serial.println("Starting maze solver!");
+  Serial.println("=== Maze Solver Ready ===");
+  delay(2000);
 }
 
+// ==================== MAIN LOOP ====================
 void loop() {
-  // Update IMU heading
   updateHeading();
   
-  // Get distances from ultrasonic sensors
-  float dist_front = getDistance(trig_front, echo_front);
-  float dist_left = getDistance(trig_left, echo_left);
-  float dist_right = getDistance(trig_right, echo_right);
+  // Get filtered distances
+  float dist_front = getFilteredDistance(trig_front, echo_front, kf_front);
+  float dist_left = getFilteredDistance(trig_left, echo_left, kf_left);
+  float dist_right = getFilteredDistance(trig_right, echo_right, kf_right);
   
-  // Print debug info
-  Serial.print("Yaw: ");
-  Serial.print(yaw);
-  Serial.print("° | F:");
-  Serial.print(dist_front);
-  Serial.print(" L:");
-  Serial.print(dist_left);
-  Serial.print(" R:");
-  Serial.println(dist_right);
+  // Debug output
+  printStatus(dist_front, dist_left, dist_right);
   
-  // LEFT-HAND RULE MAZE ALGORITHM
-  if (dist_left > 25.0) {
-    // No wall on left - turn left to follow it
-    turnLeft90();
-    Serial.println("Action: Turn LEFT (no left wall)");
+  // LEFT-HAND RULE with improved logic
+  if (dist_left > NO_WALL_THRESHOLD) {
+    // No left wall - turn left to find it
+    Serial.println(">>> Turn LEFT (no left wall)");
+    turnToAngle(yaw - 90.0);
+    moveForwardDistance(10.0); // Move a bit forward after turn
   }
   else if (dist_front < FRONT_THRESHOLD) {
-    // Wall in front - turn right
-    turnRight90();
-    Serial.println("Action: Turn RIGHT (wall ahead)");
+    // Obstacle ahead - turn right
+    Serial.println(">>> Turn RIGHT (obstacle ahead)");
+    turnToAngle(yaw + 90.0);
   }
   else {
-    // Keep going straight, but adjust to stay parallel to left wall
-    moveForwardWithWallFollow(dist_left);
+    // Follow left wall with PID control
+    moveForwardWithPID(dist_left);
   }
   
-  delay(100);
+  delay(50);
 }
 
-// Update robot heading from gyroscope
+// ==================== GYROSCOPE CALIBRATION ====================
+void calibrateGyro() {
+  const int samples = 1000;
+  long sum = 0;
+  
+  for (int i = 0; i < samples; i++) {
+    int16_t gz;
+    mpu.getRotationZ(&gz);
+    sum += gz;
+    delay(3);
+  }
+  
+  gyro_z_offset = sum / (float)samples;
+  Serial.print("Gyro Z offset: ");
+  Serial.println(gyro_z_offset);
+}
+
+// ==================== IMU HEADING UPDATE ====================
 void updateHeading() {
   unsigned long current_time = millis();
-  float dt = (current_time - last_time) / 1000.0; // Time in seconds
+  float dt = (current_time - last_time) / 1000.0;
+  if (dt <= 0) dt = 0.01;
   
-  // Read gyroscope Z-axis (rotation rate in degrees/second)
+  // Read gyroscope with offset compensation
   int16_t gz;
   mpu.getRotationZ(&gz);
-  gyro_z = gz / 131.0; // Convert to degrees/second (for MPU6050)
+  float gyro_z = (gz - gyro_z_offset) / 131.0; // Convert to deg/s
   
-  // Integrate rotation rate to get angle
+  // Integrate to get angle
   yaw += gyro_z * dt;
   
-  // Keep yaw in 0-360 range
-  if (yaw < 0) yaw += 360;
-  if (yaw >= 360) yaw -= 360;
+  // Normalize to 0-360
+  while (yaw < 0) yaw += 360.0;
+  while (yaw >= 360.0) yaw -= 360.0;
   
   last_time = current_time;
 }
 
-// Turn left exactly 90 degrees using IMU
-void turnLeft90() {
-  target_yaw = yaw - 90.0;
-  if (target_yaw < 0) target_yaw += 360;
+// ==================== FILTERED DISTANCE READING ====================
+float getFilteredDistance(int trig, int echo, KalmanFilter &kf) {
+  float raw_distance = getDistanceRaw(trig, echo);
   
-  // Turn until we reach target angle
-  while (abs(yaw - target_yaw) > 5.0) { // 5° tolerance
+  // Handle invalid readings
+  if (raw_distance > 200.0 || raw_distance < 2.0) {
+    return kf.getValue(); // Return last valid estimate
+  }
+  
+  return kf.update(raw_distance);
+}
+
+float getDistanceRaw(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  
+  float duration = pulseIn(echo, HIGH, 30000);
+  if (duration == 0) return 999.0;
+  
+  return (duration * 0.034) / 2.0;
+}
+
+// ==================== PID TURNING ====================
+void turnToAngle(float target) {
+  // Normalize target angle
+  while (target < 0) target += 360.0;
+  while (target >= 360.0) target -= 360.0;
+  
+  pid_turn.reset();
+  unsigned long turn_start = millis();
+  
+  while (millis() - turn_start < 5000) { // 5 second timeout
     updateHeading();
     
-    // Spin left
-    analogWrite(motor_left_fwd, 0);
-    analogWrite(motor_left_bck, 150);
-    analogWrite(motor_right_fwd, 150);
-    analogWrite(motor_right_bck, 0);
+    float error = angleError(target, yaw);
+    
+    if (abs(error) < TURN_TOLERANCE) {
+      stopMotors();
+      delay(200);
+      return;
+    }
+    
+    float correction = pid_turn.compute(target, yaw);
+    
+    // Apply motor correction
+    if (correction > 0) { // Turn right
+      setMotors(-correction, correction);
+    } else { // Turn left
+      setMotors(-correction, correction);
+    }
     
     delay(10);
   }
   
   stopMotors();
-  delay(200);
+  Serial.println("Turn timeout!");
 }
 
-// Turn right exactly 90 degrees using IMU
-void turnRight90() {
-  target_yaw = yaw + 90.0;
-  if (target_yaw >= 360) target_yaw -= 360;
+// Calculate shortest angle difference (handles wraparound)
+float angleError(float target, float current) {
+  float error = target - current;
   
-  // Turn until we reach target angle
-  while (abs(yaw - target_yaw) > 5.0) { // 5° tolerance
-    updateHeading();
-    
-    // Spin right
-    analogWrite(motor_left_fwd, 150);
-    analogWrite(motor_left_bck, 0);
-    analogWrite(motor_right_fwd, 0);
-    analogWrite(motor_right_bck, 150);
-    
-    delay(10);
-  }
+  if (error > 180.0) error -= 360.0;
+  if (error < -180.0) error += 360.0;
   
-  stopMotors();
-  delay(200);
+  return error;
 }
 
-// Move forward while maintaining distance from left wall
-void moveForwardWithWallFollow(float left_distance) {
-  int base_speed = 150;
-  int correction = 0;
+// ==================== PID WALL FOLLOWING ====================
+void moveForwardWithPID(float left_distance) {
+  float correction = pid_wall.compute(WALL_DISTANCE, left_distance);
   
-  // PID-like correction to stay parallel to wall
-  float error = left_distance - WALL_DISTANCE;
-  correction = error * 3; // Proportional control (tune this!)
-  
-  // Limit correction
-  correction = constrain(correction, -50, 50);
-  
-  // Apply correction to motors
-  int left_speed = base_speed - correction;
-  int right_speed = base_speed + correction;
+  int left_speed = BASE_SPEED - correction;
+  int right_speed = BASE_SPEED + correction;
   
   // Constrain speeds
   left_speed = constrain(left_speed, 0, 255);
   right_speed = constrain(right_speed, 0, 255);
   
-  // Move forward
-  analogWrite(motor_left_fwd, left_speed);
-  analogWrite(motor_left_bck, 0);
-  analogWrite(motor_right_fwd, right_speed);
-  analogWrite(motor_right_bck, 0);
+  setMotors(left_speed, right_speed);
 }
 
-// Stop all motors
+// ==================== MOVE FORWARD DISTANCE ====================
+void moveForwardDistance(float distance_cm) {
+  // Simple time-based forward movement
+  // For encoder-based distance, replace with encoder counting
+  int move_time = distance_cm * 10; // Rough estimate: 10ms per cm (tune this!)
+  
+  setMotors(BASE_SPEED, BASE_SPEED);
+  delay(move_time);
+  stopMotors();
+}
+
+// ==================== MOTOR CONTROL ====================
+void setMotors(int left_speed, int right_speed) {
+  // Left motor
+  if (left_speed >= 0) {
+    analogWrite(motor_left_fwd, left_speed);
+    analogWrite(motor_left_bck, 0);
+  } else {
+    analogWrite(motor_left_fwd, 0);
+    analogWrite(motor_left_bck, -left_speed);
+  }
+  
+  // Right motor
+  if (right_speed >= 0) {
+    analogWrite(motor_right_fwd, right_speed);
+    analogWrite(motor_right_bck, 0);
+  } else {
+    analogWrite(motor_right_fwd, 0);
+    analogWrite(motor_right_bck, -right_speed);
+  }
+}
+
 void stopMotors() {
   analogWrite(motor_left_fwd, 0);
   analogWrite(motor_left_bck, 0);
@@ -206,17 +347,14 @@ void stopMotors() {
   analogWrite(motor_right_bck, 0);
 }
 
-// Get distance from ultrasonic sensor
-float getDistance(int trig, int echo) {
-  digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trig, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-  
-  float duration = pulseIn(echo, HIGH, 30000); // 30ms timeout
-  if (duration == 0) return 999; // No echo received
-  
-  float distance = (duration * 0.034) / 2;
-  return distance;
+// ==================== DEBUG OUTPUT ====================
+void printStatus(float f, float l, float r) {
+  Serial.print("Yaw:");
+  Serial.print(yaw, 1);
+  Serial.print("° | Front:");
+  Serial.print(f, 1);
+  Serial.print(" Left:");
+  Serial.print(l, 1);
+  Serial.print(" Right:");
+  Serial.println(r, 1);
 }
